@@ -570,6 +570,9 @@ async fn handle_execution_request<'a>(
         let computable_by = expiry / 2;
 
         if computable_by < expiry {
+            // the way this is done can cause race conditions where so many request come in a short time that we accept
+            // them before we change the value of g so we optimistically change to inflight and we will decrement if we dont win the claim
+
             // First, resolve public inputs
             let inputs = exec.input().ok_or(Risc0RunnerError::InvalidData)?;
             let program_inputs = emit_event_with_duration!(MetricEvents::InputDownload, {
