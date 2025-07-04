@@ -668,11 +668,31 @@ async fn handle_execution_request<'a>(
             let mem_image = img.get_memory_image()?;
 
             // Execute the program to get metrics before claiming
-            let inputs = input_staging_area
+            let mut inputs = input_staging_area
                 .get(&eid)
                 .ok_or(Risc0RunnerError::InvalidData)?
                 .value()
                 .clone();
+
+            let unresolved_count = inputs
+                .iter()
+                .filter(|i| match i {
+                    ProgramInput::Unresolved(_) => true,
+                    _ => false,
+                })
+                .count();
+
+            if unresolved_count > 0 {
+                info!("{} outstanding inputs", unresolved_count);
+
+                emit_event_with_duration!(MetricEvents::InputDownload, {
+                            input_resolver.resolve_private_inputs(eid.as_str(), &mut inputs, Arc::new(transaction_sender)).await?;
+                        }, execution_id => eid, stage => "private");
+                input_staging_area.insert(eid.to_string(), inputs.clone());
+                // one of the huge problems with the claim system is that we are not guaranteed to have
+                // the inputs we need at the time we claim and no way to
+            }
+            info!("{} inputs resolved", unresolved_count);
 
             // Execute the program to get metrics
             info!("Executing program to get metrics before claiming");
