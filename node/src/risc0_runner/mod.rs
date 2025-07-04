@@ -83,7 +83,6 @@ pub enum Risc0RunnerError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClaimStatus {
     Claiming,
-    Executed,
     Submitted,
 }
 
@@ -206,7 +205,6 @@ impl Risc0Runner {
                                             txn_sender.clear_signature_status(&sig);
                                             if status.err.is_some() {
                                                 info!("Claim Transaction Failed");
-
                                             }
                                             status.err.is_none()
                                         },
@@ -214,10 +212,6 @@ impl Risc0Runner {
                                     }
                                 }
                             };
-                        }
-                        ClaimStatus::Executed => {
-                            // Keep the execution in progress
-                            return true;
                         }
                         ClaimStatus::Submitted => {
                             if let Some(sig) = v.submission_signature.as_ref() {
@@ -385,17 +379,20 @@ pub async fn handle_claim<'a>(
     if let Some(mut claim) = claim_status {
         emit_event!(MetricEvents::ClaimReceived, execution_id => execution_id);
         match claim.status {
-            ClaimStatus::Claiming => {
+            ClaimStatus::Claiming  => {
                 if let Some(image) = loaded_images.get(&claim.image_id) {
                     if image.data.is_none() {
                         return Err(Risc0RunnerError::ImageDataUnavailable.into());
                     }
-                    //if image is not loaded at claim, fail
+
+                    // Get the inputs
                     let mut inputs = input_staging_area
                         .get(execution_id)
                         .ok_or(Risc0RunnerError::InvalidData)?
                         .value()
-                        .clone(); //clone soe we dont hold a reference over http requests
+                        .clone(); //clone so we dont hold a reference over http requests
+
+                    // Resolve any unresolved inputs if needed
                     let unresolved_count = inputs
                         .iter()
                         .filter(|i| match i {
@@ -436,12 +433,9 @@ pub async fn handle_claim<'a>(
 
                     match execution_result {
                         Ok((journal, assumptions_digest, receipt)) => {
-                            // Update the claim status to Executed
-                            claim.status = ClaimStatus::Executed;
-                            in_flight_proofs.insert(execution_id.to_string(), claim.clone());
-
-                            // Emit execution metrics for the execution_id
                             emit_event!(MetricEvents::ExecutionComplete, execution_id => execution_id);
+
+                            // Compress the proof
                             let compressed_receipt = risc0_compress_proof(
                                 config.stark_compression_tools_path.as_str(),
                                 receipt,
@@ -452,6 +446,7 @@ pub async fn handle_claim<'a>(
                                 Risc0RunnerError::ProofCompressionError
                             })?;
 
+                            // Submit the proof
                             let (input_digest, committed_outputs) = journal.bytes.split_at(32);
                             let sig = transaction_sender
                                 .submit_proof(
@@ -473,6 +468,7 @@ pub async fn handle_claim<'a>(
                                     Risc0RunnerError::TransactionError(e.to_string())
                                 })?;
 
+                            // Update the claim status
                             claim.status = ClaimStatus::Submitted;
                             claim.submission_signature = Some(sig);
                             in_flight_proofs.insert(eid.clone(), claim);
@@ -483,87 +479,6 @@ pub async fn handle_claim<'a>(
                         }
                     }
                     in_flight_proofs.remove(&eid);
-                } else {
-                    info!("Image not loaded, fatal error aborting execution");
-                }
-            }
-            ClaimStatus::Executed => {
-                // The execution has already been completed, so we just need to generate the proof
-                info!("Claim already executed, generating proof");
-
-                if let Some(image) = loaded_images.get(&claim.image_id) {
-                    if image.data.is_none() {
-                        return Err(Risc0RunnerError::ImageDataUnavailable.into());
-                    }
-
-                    // Get the inputs
-                    let inputs = input_staging_area
-                        .get(execution_id)
-                        .ok_or(Risc0RunnerError::InvalidData)?
-                        .value()
-                        .clone();
-
-                    // Get the memory image
-                    let mem_image = image.get_memory_image()?;
-
-                    // Execute and prove in a single step (we need to re-execute to get the proof)
-                    let execution_result: Result<
-                        (Journal, Digest, SuccinctReceipt<ReceiptClaim>),
-                        Risc0RunnerError,
-                    > = tokio::task::spawn_blocking(move || {
-                        risc0_prove(mem_image, inputs).map_err(|e| {
-                            info!("Error executing program: {:?}", e);
-                            Risc0RunnerError::ProofGenerationError
-                        })
-                    })
-                    .await?;
-
-                    match execution_result {
-                        Ok((journal, assumptions_digest, receipt)) => {
-                            // Compress the proof
-                            let compressed_receipt = risc0_compress_proof(
-                                config.stark_compression_tools_path.as_str(),
-                                receipt,
-                            )
-                            .await
-                            .map_err(|e| {
-                                info!("Error compressing proof: {:?}", e);
-                                Risc0RunnerError::ProofCompressionError
-                            })?;
-
-                            // Submit the proof
-                            let (input_digest, committed_outputs) = journal.bytes.split_at(32);
-                            let sig = transaction_sender
-                                .submit_proof(
-                                    execution_id,
-                                    claim.requester,
-                                    claim.program_callback.clone(),
-                                    &compressed_receipt.proof,
-                                    &compressed_receipt.execution_digest,
-                                    input_digest,
-                                    assumptions_digest.as_bytes(),
-                                    committed_outputs,
-                                    claim.additional_accounts.clone(),
-                                    compressed_receipt.exit_code_system,
-                                    compressed_receipt.exit_code_user,
-                                )
-                                .await
-                                .map_err(|e| {
-                                    error!("Error submitting proof: {:?}", e);
-                                    Risc0RunnerError::TransactionError(e.to_string())
-                                })?;
-
-                            // Update the claim status
-                            claim.status = ClaimStatus::Submitted;
-                            claim.submission_signature = Some(sig);
-                            in_flight_proofs.insert(execution_id.to_string(), claim);
-                            info!("Proof submitted: {:?}", sig);
-                        }
-                        Err(e) => {
-                            info!("Error executing program: {:?}", e);
-                        }
-                    }
-                    in_flight_proofs.remove(execution_id);
                 } else {
                     info!("Image not loaded, fatal error aborting execution");
                 }
@@ -714,7 +629,7 @@ async fn handle_execution_request<'a>(
                     info!("Execution completed for image {}, segments: {}", image_id, segments);
                     emit_event!(MetricEvents::ExecutionComplete, execution_id => eid);
 
-                    // Now that we have metrics, we can decide whether to claim
+                    // Now that we have metrics, we can decide whether to claim here
                     let sig = transaction_sender
                         .claim(&eid, accounts[0], accounts[2], computable_by)
                         .await
@@ -743,7 +658,7 @@ async fn handle_execution_request<'a>(
                                 InflightProof {
                                     execution_id: eid.clone(),
                                     image_id: image_id.clone(),
-                                    status: ClaimStatus::Executed, // Mark as executed since we've already run it
+                                    status: ClaimStatus::Claiming,
                                     expiry,
                                     claim_signature: sig,
                                     submission_signature: None,
