@@ -18,6 +18,8 @@ pub enum MetricEvents {
     ImageLoaded,
     ImageComputeEstimate,
     ExecutionRequest,
+    ExecutionComplete,
+    ExecutionCycles,
     ProofGeneration,
     ProofCompression,
     ProofConversion,

@@ -108,6 +108,7 @@ type LoadedImageMapRef<'a> = &'a DashMap<String, Image>;
 type InputStagingArea = Arc<DashMap<String, Vec<ProgramInput>>>;
 type InputStagingAreaRef<'a> = &'a DashMap<String, Vec<ProgramInput>>;
 
+
 pub struct Risc0Runner {
     config: Arc<ProverNodeConfig>,
     loaded_images: LoadedImageMap,
@@ -204,7 +205,6 @@ impl Risc0Runner {
                                             txn_sender.clear_signature_status(&sig);
                                             if status.err.is_some() {
                                                 info!("Claim Transaction Failed");
-
                                             }
                                             status.err.is_none()
                                         },
@@ -378,97 +378,114 @@ pub async fn handle_claim<'a>(
         .map(|v| v.value().to_owned());
     if let Some(mut claim) = claim_status {
         emit_event!(MetricEvents::ClaimReceived, execution_id => execution_id);
-        if let ClaimStatus::Claiming = claim.status {
-            if let Some(image) = loaded_images.get(&claim.image_id) {
-                if image.data.is_none() {
-                    return Err(Risc0RunnerError::ImageDataUnavailable.into());
-                }
-                //if image is not loaded at claim, fail
-                let mut inputs = input_staging_area
-                    .get(execution_id)
-                    .ok_or(Risc0RunnerError::InvalidData)?
-                    .value()
-                    .clone(); //clone soe we dont hold a reference over http requests
-                let unresolved_count = inputs
-                    .iter()
-                    .filter(|i| match i {
-                        ProgramInput::Unresolved(_) => true,
-                        _ => false,
+        match claim.status {
+            ClaimStatus::Claiming  => {
+                if let Some(image) = loaded_images.get(&claim.image_id) {
+                    if image.data.is_none() {
+                        return Err(Risc0RunnerError::ImageDataUnavailable.into());
+                    }
+
+                    // Get the inputs
+                    let mut inputs = input_staging_area
+                        .get(execution_id)
+                        .ok_or(Risc0RunnerError::InvalidData)?
+                        .value()
+                        .clone(); //clone so we dont hold a reference over http requests
+
+                    // Resolve any unresolved inputs if needed
+                    let unresolved_count = inputs
+                        .iter()
+                        .filter(|i| match i {
+                            ProgramInput::Unresolved(_) => true,
+                            _ => false,
+                        })
+                        .count();
+
+                    if unresolved_count > 0 {
+                        info!("{} outstanding inputs", unresolved_count);
+
+                        emit_event_with_duration!(MetricEvents::InputDownload, {
+                            input_resolver.resolve_private_inputs(execution_id, &mut inputs, Arc::new(transaction_sender)).await?;
+                        }, execution_id => execution_id, stage => "private");
+                        input_staging_area.insert(execution_id.to_string(), inputs);
+                        // one of the huge problems with the claim system is that we are not guaranteed to have
+                        // the inputs we need at the time we claim and no way to
+                    }
+                    info!("{} inputs resolved", unresolved_count);
+
+                    // drain the inputs and own them here, this is a bit of a hack but it works
+                    let (eid, inputs) = input_staging_area
+                        .remove(execution_id)
+                        .ok_or(Risc0RunnerError::InvalidData)?;
+                    let mem_image = image.get_memory_image()?;
+
+                    // Execute and prove in a single step
+                    let execution_result: Result<
+                        (Journal, Digest, SuccinctReceipt<ReceiptClaim>),
+                        Risc0RunnerError,
+                    > = tokio::task::spawn_blocking(move || {
+                        risc0_prove(mem_image, inputs).map_err(|e| {
+                            info!("Error executing program: {:?}", e);
+                            Risc0RunnerError::ProofGenerationError
+                        })
                     })
-                    .count();
+                    .await?;
 
-                if unresolved_count > 0 {
-                    info!("{} outstanding inputs", unresolved_count);
+                    match execution_result {
+                        Ok((journal, assumptions_digest, receipt)) => {
+                            emit_event!(MetricEvents::ExecutionComplete, execution_id => execution_id);
 
-                    emit_event_with_duration!(MetricEvents::InputDownload, {
-                        input_resolver.resolve_private_inputs(execution_id, &mut inputs, Arc::new(transaction_sender)).await?;
-                    }, execution_id => execution_id, stage => "private");
-                    input_staging_area.insert(execution_id.to_string(), inputs);
-                    // one of the huge problems with the claim system is that we are not guaranteed to have
-                    // the inputs we need at the time we claim and no way to
-                }
-                info!("{} inputs resolved", unresolved_count);
-
-                // drain the inputs and own them here, this is a bit of a hack but it works
-                let (eid, inputs) = input_staging_area
-                    .remove(execution_id)
-                    .ok_or(Risc0RunnerError::InvalidData)?;
-                let mem_image = image.get_memory_image()?;
-                let result: Result<
-                    (Journal, Digest, SuccinctReceipt<ReceiptClaim>),
-                    Risc0RunnerError,
-                > = tokio::task::spawn_blocking(move || {
-                    risc0_prove(mem_image, inputs).map_err(|e| {
-                        info!("Error generating proof: {:?}", e);
-                        Risc0RunnerError::ProofGenerationError
-                    })
-                })
-                .await?;
-                match result {
-                    Ok((journal, assumptions_digest, receipt)) => {
-                        let compressed_receipt = risc0_compress_proof(
-                            config.stark_compression_tools_path.as_str(),
-                            receipt,
-                        )
-                        .await
-                        .map_err(|e| {
-                            info!("Error compressing proof: {:?}", e);
-                            Risc0RunnerError::ProofCompressionError
-                        })?;
-
-                        let (input_digest, committed_outputs) = journal.bytes.split_at(32);
-                        let sig = transaction_sender
-                            .submit_proof(
-                                &eid,
-                                claim.requester,
-                                claim.program_callback.clone(),
-                                &compressed_receipt.proof,
-                                &compressed_receipt.execution_digest,
-                                input_digest,
-                                assumptions_digest.as_bytes(),
-                                committed_outputs,
-                                claim.additional_accounts.clone(),
-                                compressed_receipt.exit_code_system,
-                                compressed_receipt.exit_code_user,
+                            // Compress the proof
+                            let compressed_receipt = risc0_compress_proof(
+                                config.stark_compression_tools_path.as_str(),
+                                receipt,
                             )
                             .await
                             .map_err(|e| {
-                                error!("Error submitting proof: {:?}", e);
-                                Risc0RunnerError::TransactionError(e.to_string())
+                                info!("Error compressing proof: {:?}", e);
+                                Risc0RunnerError::ProofCompressionError
                             })?;
 
-                        claim.status = ClaimStatus::Submitted;
-                        claim.submission_signature = Some(sig);
-                        in_flight_proofs.insert(eid.clone(), claim);
-                        info!("Proof submitted: {:?}", sig);
+                            // Submit the proof
+                            let (input_digest, committed_outputs) = journal.bytes.split_at(32);
+                            let sig = transaction_sender
+                                .submit_proof(
+                                    &eid,
+                                    claim.requester,
+                                    claim.program_callback.clone(),
+                                    &compressed_receipt.proof,
+                                    &compressed_receipt.execution_digest,
+                                    input_digest,
+                                    assumptions_digest.as_bytes(),
+                                    committed_outputs,
+                                    claim.additional_accounts.clone(),
+                                    compressed_receipt.exit_code_system,
+                                    compressed_receipt.exit_code_user,
+                                )
+                                .await
+                                .map_err(|e| {
+                                    error!("Error submitting proof: {:?}", e);
+                                    Risc0RunnerError::TransactionError(e.to_string())
+                                })?;
+
+                            // Update the claim status
+                            claim.status = ClaimStatus::Submitted;
+                            claim.submission_signature = Some(sig);
+                            in_flight_proofs.insert(eid.clone(), claim);
+                            info!("Proof submitted: {:?}", sig);
+                        }
+                        Err(e) => {
+                            info!("Error executing program: {:?}", e);
+                        }
                     }
-                    Err(e) => {
-                        info!("Error generating proof: {:?}", e);
-                    }
-                };
-                in_flight_proofs.remove(&eid);
-            } else {
-                info!("Image not loaded, fatal error aborting execution");
+                    in_flight_proofs.remove(&eid);
+                } else {
+                    info!("Image not loaded, fatal error aborting execution");
+                }
+            }
+            ClaimStatus::Submitted => {
+                // The proof has already been submitted, nothing to do
+                info!("Claim already submitted");
             }
         }
     }
@@ -547,14 +564,16 @@ async fn handle_execution_request<'a>(
         .ok_or(Risc0RunnerError::ImgLoadError)?;
 
         // naive compute cost estimate which is YES WE CAN DO THIS in the default amount of time
-        emit_histogram!(MetricEvents::ImageComputeEstimate, img.size  as f64, image_id => image_id.clone());
+        emit_histogram!(MetricEvents::ImageComputeEstimate, img.size as f64, image_id => image_id.clone());
         //ensure compute can happen before expiry
         //execution_block + (image_compute_estimate % config.max_compute_per_block) + 1 some bogus calc
         let computable_by = expiry / 2;
 
         if computable_by < expiry {
-            //the way this is done can cause race conditions where so many request come in a short time that we accept
+            // the way this is done can cause race conditions where so many request come in a short time that we accept
             // them before we change the value of g so we optimistically change to inflight and we will decrement if we dont win the claim
+
+            // First, resolve public inputs
             let inputs = exec.input().ok_or(Risc0RunnerError::InvalidData)?;
             let program_inputs = emit_event_with_duration!(MetricEvents::InputDownload, {
                 input_resolver.resolve_public_inputs(
@@ -562,61 +581,120 @@ async fn handle_execution_request<'a>(
                 ).await?
             }, execution_id => eid, stage => "public");
             input_staging_area.insert(eid.clone(), program_inputs);
-            let sig = transaction_sender
-                .claim(&eid, accounts[0], accounts[2], computable_by)
-                .await
-                .map_err(|e| Risc0RunnerError::TransactionError(e.to_string()));
-            match sig {
-                Ok(sig) => {
-                    let callback_program = exec
-                        .callback_program_id()
-                        .and_then::<[u8; 32], _>(|v| v.bytes().try_into().ok())
-                        .map(Pubkey::from);
-                    let callback = if callback_program.is_some() {
-                        Some(ProgramExec {
-                            program_id: callback_program.unwrap(),
-                            instruction_prefix: exec
-                                .callback_instruction_prefix()
-                                .map(|v| v.bytes().to_vec())
-                                .unwrap_or(vec![0x1]),
-                        })
-                    } else {
-                        None
-                    };
 
-                    in_flight_proofs.insert(
-                        eid.clone(),
-                        InflightProof {
-                            execution_id: eid.clone(),
-                            image_id: image_id.clone(),
-                            status: ClaimStatus::Claiming,
-                            expiry,
-                            claim_signature: sig,
-                            submission_signature: None,
-                            requester: accounts[0],
-                            program_callback: callback,
-                            additional_accounts: exec
-                                .callback_extra_accounts()
-                                .unwrap_or_default()
-                                .into_iter()
-                                .map(|a| {
-                                    let pkbytes: [u8; 32] = a.pubkey().into();
-                                    let pubkey = Pubkey::try_from(pkbytes).unwrap_or_default();
-                                    let writable = a.writable();
-                                    AccountMeta {
-                                        pubkey,
-                                        is_writable: writable == 1,
-                                        is_signer: false,
-                                    }
+            // Get the memory image
+            let mem_image = img.get_memory_image()?;
+
+            // Execute the program to get metrics before claiming
+            let mut inputs = input_staging_area
+                .get(&eid)
+                .ok_or(Risc0RunnerError::InvalidData)?
+                .value()
+                .clone();
+
+            let unresolved_count = inputs
+                .iter()
+                .filter(|i| match i {
+                    ProgramInput::Unresolved(_) => true,
+                    _ => false,
+                })
+                .count();
+
+            if unresolved_count > 0 {
+                info!("{} outstanding inputs", unresolved_count);
+
+                emit_event_with_duration!(MetricEvents::InputDownload, {
+                            input_resolver.resolve_private_inputs(eid.as_str(), &mut inputs, Arc::new(transaction_sender)).await?;
+                        }, execution_id => eid, stage => "private");
+                input_staging_area.insert(eid.to_string(), inputs.clone());
+                // one of the huge problems with the claim system is that we are not guaranteed to have
+                // the inputs we need at the time we claim and no way to
+            }
+            info!("{} inputs resolved", unresolved_count);
+
+            // Execute the program to get metrics
+            info!("Executing program to get metrics before claiming");
+            let execution_result = tokio::task::spawn_blocking(move || {
+                // Create execution environment and run
+                let mut exec_env = new_risc0_exec_env(mem_image, inputs)?;
+                let session = exec_env.run()?;
+
+                // TODO: What about cycles or other values from session
+                // Emit metrics for execution
+                let segments = session.segments.len() as f64;
+                Ok::<f64, anyhow::Error>(segments)
+            }).await?;
+
+            match execution_result {
+                Ok(segments) => {
+                    // Execution succeeded, emit metrics
+                    emit_histogram!(MetricEvents::ExecutionCycles, segments, system => "risc0", image_id => &image_id);
+                    info!("Execution completed for image {}, segments: {}", image_id, segments);
+                    emit_event!(MetricEvents::ExecutionComplete, execution_id => eid);
+
+                    // Now that we have metrics, we can decide whether to claim here
+                    let sig = transaction_sender
+                        .claim(&eid, accounts[0], accounts[2], computable_by)
+                        .await
+                        .map_err(|e| Risc0RunnerError::TransactionError(e.to_string()));
+
+                    match sig {
+                        Ok(sig) => {
+                            let callback_program = exec
+                                .callback_program_id()
+                                .and_then::<[u8; 32], _>(|v| v.bytes().try_into().ok())
+                                .map(Pubkey::from);
+                            let callback = if callback_program.is_some() {
+                                Some(ProgramExec {
+                                    program_id: callback_program.unwrap(),
+                                    instruction_prefix: exec
+                                        .callback_instruction_prefix()
+                                        .map(|v| v.bytes().to_vec())
+                                        .unwrap_or(vec![0x1]),
                                 })
-                                .collect(),
-                        },
-                    );
-                    emit_event!(MetricEvents::ClaimAttempt, execution_id => eid);
+                            } else {
+                                None
+                            };
+
+                            in_flight_proofs.insert(
+                                eid.clone(),
+                                InflightProof {
+                                    execution_id: eid.clone(),
+                                    image_id: image_id.clone(),
+                                    status: ClaimStatus::Claiming,
+                                    expiry,
+                                    claim_signature: sig,
+                                    submission_signature: None,
+                                    requester: accounts[0],
+                                    program_callback: callback,
+                                    additional_accounts: exec
+                                        .callback_extra_accounts()
+                                        .unwrap_or_default()
+                                        .into_iter()
+                                        .map(|a| {
+                                            let pkbytes: [u8; 32] = a.pubkey().into();
+                                            let pubkey = Pubkey::try_from(pkbytes).unwrap_or_default();
+                                            let writable = a.writable();
+                                            AccountMeta {
+                                                pubkey,
+                                                is_writable: writable == 1,
+                                                is_signer: false,
+                                            }
+                                        })
+                                        .collect(),
+                                },
+                            );
+                            emit_event!(MetricEvents::ClaimAttempt, execution_id => eid);
+                        }
+                        Err(e) => {
+                            info!("Error claiming: {:?}", e);
+                            in_flight_proofs.remove(&eid);
+                        }
+                    }
                 }
                 Err(e) => {
-                    info!("Error claiming: {:?}", e);
-                    in_flight_proofs.remove(&eid);
+                    info!("Error executing program: {:?}", e);
+                    // Don't claim if execution fails
                 }
             }
         }
@@ -651,11 +729,11 @@ async fn handle_image_deployment<'a>(
     let size = deploy.size_();
     let image_id = deploy.image_id().unwrap_or_default();
     let program_name = deploy.program_name().unwrap_or_default();
-    
+
     info!("Attempting to download image from URL: {}", url);
     info!("Image ID: {}, Size: {}", image_id, size);
     info!("Program name: {}", program_name);
-    
+
     emit_histogram!(MetricEvents::ImageDownload, size as f64, url => url.to_string());
     emit_event_with_duration!(MetricEvents::ImageDownload, {
         // The URL from deployment data already includes the full path
@@ -687,7 +765,7 @@ async fn handle_image_deployment<'a>(
     }, url => url.to_string())
 }
 
-// proving function, no async this is cpu/gpu intesive
+// proving function, no async this is cpu/gpu intensive
 fn risc0_prove(
     memory_image: MemoryImage,
     sorted_inputs: Vec<ProgramInput>,
@@ -695,6 +773,13 @@ fn risc0_prove(
     let image_id = memory_image.compute_id().to_string();
     let mut exec = new_risc0_exec_env(memory_image, sorted_inputs)?;
     let session = exec.run()?;
+
+    // Emit metrics for execution
+    emit_histogram!(MetricEvents::ExecutionCycles, session.segments.len() as f64, system => "risc0", image_id => &image_id);
+    info!("Execution completed for image {}", image_id);
+    emit_event!(MetricEvents::ExecutionComplete, execution_id => "unknown");
+
+    // Now, generate the proof in the same thread
     // Obtain the default prover.
     let prover = get_risc0_prover()?;
     let ctx = VerifierContext::default();
